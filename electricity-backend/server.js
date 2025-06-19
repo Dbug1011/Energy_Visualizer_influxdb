@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { Client } = require("@elastic/elasticsearch");
+const { InfluxDB, Point } = require("@influxdata/influxdb-client");
 const cors = require("cors");
 const dayjs = require("dayjs");
 const utc = require("dayjs/plugin/utc");
@@ -27,6 +27,7 @@ app.use(
       "http://142.91.104.5:3000",
       "http://142.91.104.5:3001",
       "http://142.91.104.5",
+      "http://142.91.104.5:8086",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -36,26 +37,28 @@ app.use(
 
 app.use(express.json());
 
-// Elasticsearch client with connection pooling
-const esClient = new Client({
-  node: process.env.ES_NODE || "http://localhost:9200",
-  auth: {
-    username: process.env.ES_USERNAME,
-    password: process.env.ES_PASSWORD,
-  },
-  compatibilityHeader: false,
-  maxRetries: 3,
-  requestTimeout: 30000,
-  sniffOnStart: true,
+// InfluxDB client configuration
+const influxDB = new InfluxDB({
+  url: process.env.INFLUXDB_URL,
+  token: process.env.INFLUXDB_TOKEN,
 });
 
-// Test Elasticsearch connection on startup
+const queryApi = influxDB.getQueryApi(process.env.INFLUXDB_ORG);
+const INFLUXDB_BUCKET = process.env.INFLUXDB_BUCKET;
+
+// Test InfluxDB connection on startup
 (async () => {
   try {
-    const health = await esClient.cluster.health();
-    console.log("✅ Elasticsearch connected successfully", health.status);
+    const testQuery = `
+      from(bucket: "${INFLUXDB_BUCKET}")
+        |> range(start: -1h)
+        |> limit(n: 1)
+    `;
+
+    const result = await queryApi.collectRows(testQuery);
+    console.log("✅ InfluxDB connected successfully");
   } catch (err) {
-    console.error("❌ Elasticsearch connection failed:", err.message);
+    console.error("❌ InfluxDB connection failed:", err.message);
   }
 })();
 
@@ -81,21 +84,23 @@ const getMetersMapping = async () => {
   }
 
   try {
-    const response = await esClient.search({
-      index: "meters_idx",
-      timeout: "30s",
-      body: {
-        query: { match_all: {} },
-        size: 10000,
-        _source: ["meter_mac", "room_id"],
-      },
-    });
+    // Query meters mapping from InfluxDB
+    const query = `
+      from(bucket: "${INFLUXDB_BUCKET}")
+        |> range(start: 0)
+        |> filter(fn: (r) => r._measurement == "meters")
+        |> filter(fn: (r) => r._field == "room_id")
+        |> distinct(column: "meter_mac")
+        |> keep(columns: ["meter_mac", "_value"])
+        |> rename(columns: {_value: "room_id"})
+    `;
 
+    const rows = await queryApi.collectRows(query);
     const macToRoomMap = {};
-    response.hits.hits.forEach((hit) => {
-      const { meter_mac, room_id } = hit._source;
-      if (meter_mac && room_id) {
-        macToRoomMap[normalizeMacAddress(meter_mac)] = room_id;
+
+    rows.forEach((row) => {
+      if (row.meter_mac && row.room_id) {
+        macToRoomMap[normalizeMacAddress(row.meter_mac)] = row.room_id;
       }
     });
 
@@ -117,97 +122,97 @@ const buildDateRangeQuery = (period, date) => {
 
   const ranges = {
     // For hourly view: cover the entire selected local day
-    // Local day 2025-06-16 00:00 to 23:59 = UTC 2025-06-15 16:00 to 2025-06-16 15:59
     hour: {
-      gte: localDate.startOf("day").utc().toISOString(),
-      lte: localDate.endOf("day").utc().toISOString(),
+      start: localDate.startOf("day").utc().toISOString(),
+      stop: localDate.endOf("day").utc().toISOString(),
     },
     // For daily view: cover the entire selected local month
-    // Local month June 2025 = UTC 2025-05-31 16:00 to 2025-06-30 15:59
     day: {
-      gte: localDate.startOf("month").utc().toISOString(),
-      lte: localDate.endOf("month").utc().toISOString(),
+      start: localDate.startOf("month").utc().toISOString(),
+      stop: localDate.endOf("month").utc().toISOString(),
     },
     // For monthly view: cover the entire selected local year
-    // Local year 2025 = UTC 2024-12-31 16:00 to 2025-12-31 15:59
     month: {
-      gte: localDate.startOf("year").utc().toISOString(),
-      lte: localDate.endOf("year").utc().toISOString(),
+      start: localDate.startOf("year").utc().toISOString(),
+      stop: localDate.endOf("year").utc().toISOString(),
     },
     // For yearly view: from start of data to end of selected local year
     year: {
-      gte: "2023-01-01T00:00:00.000Z", // Adjust based on your actual data start
-      lte: localDate.endOf("year").utc().toISOString(),
+      start: "2023-01-01T00:00:00.000Z", // Adjust based on your actual data start
+      stop: localDate.endOf("year").utc().toISOString(),
     },
   };
 
   return ranges[period] || ranges.hour;
 };
 
-// Generic function to build Elasticsearch query
-const buildEsQuery = (dateRange, macFilter) => ({
-  query: {
-    bool: {
-      filter: [{ range: { log_datetime: dateRange } }, ...macFilter],
-    },
-  },
-  aggs: {
-    by_mac: {
-      terms: {
-        field: "mac_address.keyword",
-        size: 1000,
-      },
-      aggs: {
-        first_energy: {
-          top_hits: {
-            sort: [{ log_datetime: { order: "asc" } }],
-            _source: ["energy", "log_datetime"],
-            size: 1,
-          },
-        },
-        last_energy: {
-          top_hits: {
-            sort: [{ log_datetime: { order: "desc" } }],
-            _source: ["energy", "log_datetime"],
-            size: 1,
-          },
-        },
-      },
-    },
-  },
-  size: 0,
-});
+// Build InfluxDB query for energy consumption
+const buildInfluxQuery = (dateRange, macFilter, timePeriod = null) => {
+  let query = `
+    from(bucket: "${INFLUXDB_BUCKET}")
+      |> range(start: ${dateRange.start}, stop: ${dateRange.stop})
+      |> filter(fn: (r) => r._measurement == "pzem")
+      |> filter(fn: (r) => r._field == "energy")
+  `;
 
-// Update: Only sum consumption for MACs in meters table (rooms 1-16), exclude others for "all rooms"
-const calculateEnergyFromBuckets = (buckets, macToRoomMap, room) => {
+  // Add time period filter if specified
+  if (timePeriod) {
+    query += `
+      |> range(start: ${timePeriod.utcStart}, stop: ${timePeriod.utcEnd})
+    `;
+  }
+
+  // Add MAC address filter if specified
+  if (macFilter && macFilter.length > 0) {
+    const macAddresses = macFilter.map((mac) => `"${mac}"`).join(", ");
+    query += `
+      |> filter(fn: (r) => contains(value: r.mac_address, set: [${macAddresses}]))
+    `;
+  }
+
+  return query;
+};
+
+// Calculate energy consumption from InfluxDB results
+const calculateEnergyFromInfluxData = (data, macToRoomMap, room) => {
   let consumptionEnergy = 0;
   let supplyEnergy = 0;
 
-  buckets.forEach((macBucket) => {
-    const macAddress = macBucket.key;
+  // Group data by MAC address
+  const macGroups = {};
+  data.forEach((row) => {
+    if (!macGroups[row.mac_address]) {
+      macGroups[row.mac_address] = [];
+    }
+    macGroups[row.mac_address].push(row);
+  });
+
+  // Calculate energy delta for each MAC
+  Object.entries(macGroups).forEach(([macAddress, readings]) => {
+    if (readings.length < 2) return; // Need at least 2 readings to calculate delta
+
+    // Sort by time to get first and last readings
+    readings.sort((a, b) => new Date(a._time) - new Date(b._time));
+    const firstReading = readings[0];
+    const lastReading = readings[readings.length - 1];
+
+    const energyDelta = lastReading._value - firstReading._value;
     const normalizedMac = normalizeMacAddress(macAddress);
-    const firstReading = macBucket.first_energy.hits.hits[0];
-    const lastReading = macBucket.last_energy.hits.hits[0];
 
-    if (firstReading && lastReading) {
-      const energyDelta =
-        lastReading._source.energy - firstReading._source.energy;
-
-      if (normalizedMac === SUPPLY_MAC_NORMALIZED) {
-        supplyEnergy += energyDelta;
-      } else if (room) {
-        // If a specific room is requested, keep original logic
-        if (
-          macToRoomMap.hasOwnProperty(normalizedMac) &&
-          macToRoomMap[normalizedMac].toString() === room.toString()
-        ) {
-          consumptionEnergy += energyDelta;
-        }
-      } else {
-        // For all rooms: only sum MACs that are in meters table (rooms 1-16)
-        if (macToRoomMap.hasOwnProperty(normalizedMac)) {
-          consumptionEnergy += energyDelta;
-        }
+    if (normalizedMac === SUPPLY_MAC_NORMALIZED) {
+      supplyEnergy += energyDelta;
+    } else if (room) {
+      // If a specific room is requested
+      if (
+        macToRoomMap.hasOwnProperty(normalizedMac) &&
+        macToRoomMap[normalizedMac].toString() === room.toString()
+      ) {
+        consumptionEnergy += energyDelta;
+      }
+    } else {
+      // For all rooms: only sum MACs that are in meters table
+      if (macToRoomMap.hasOwnProperty(normalizedMac)) {
+        consumptionEnergy += energyDelta;
       }
     }
   });
@@ -224,39 +229,32 @@ const getTimePeriods = (period, dateRange, inputDate) => {
   const localInputDate = dayjs.tz(inputDate, TIMEZONE);
 
   const configs = {
-    // For hourly: iterate through each hour of the selected local day
-    // Example: 2025-06-16 input -> hours 00:00, 01:00, ..., 23:00 in local time
     hour: {
       unit: "hour",
       format: "HH:00",
-      start: localInputDate.startOf("day"), // 2025-06-16 00:00:00 +08:00
-      end: localInputDate.endOf("day"), // 2025-06-16 23:59:59 +08:00
+      start: localInputDate.startOf("day"),
+      end: localInputDate.endOf("day"),
       getValue: (d) => d.hour(),
     },
-    // For daily: iterate through each day of the selected local month
-    // Example: 2025-06-16 input -> days 1, 2, ..., 30 of June 2025
     day: {
       unit: "day",
       format: "MMM DD",
-      start: localInputDate.startOf("month"), // 2025-06-01 00:00:00 +08:00
-      end: localInputDate.endOf("month"), // 2025-06-30 23:59:59 +08:00
+      start: localInputDate.startOf("month"),
+      end: localInputDate.endOf("month"),
       getValue: (d) => d.date(),
     },
-    // For monthly: iterate through each month of the selected local year
-    // Example: 2025-06-16 input -> months Jan, Feb, ..., Dec of 2025
     month: {
       unit: "month",
       format: "MMMM",
-      start: localInputDate.startOf("year"), // 2025-01-01 00:00:00 +08:00
-      end: localInputDate.endOf("year"), // 2025-12-31 23:59:59 +08:00
+      start: localInputDate.startOf("year"),
+      end: localInputDate.endOf("year"),
       getValue: (d) => d.month(),
     },
-    // For yearly: iterate through years from data start to selected year
     year: {
       unit: "year",
       format: "YYYY",
-      start: dayjs.tz("2023-01-01", TIMEZONE), // Adjust based on your data start
-      end: localInputDate.endOf("year"), // 2025-12-31 23:59:59 +08:00
+      start: dayjs.tz("2023-01-01", TIMEZONE),
+      end: localInputDate.endOf("year"),
       getValue: (d) => d.year(),
     },
   };
@@ -270,7 +268,6 @@ const getTimePeriods = (period, dateRange, inputDate) => {
     current.isBefore(config.end) ||
     current.isSame(config.end, config.unit)
   ) {
-    // Convert local time period to UTC for Elasticsearch query
     const utcStart = current.startOf(config.unit).utc().toISOString();
     const utcEnd = current.endOf(config.unit).utc().toISOString();
 
@@ -289,7 +286,7 @@ const getTimePeriods = (period, dateRange, inputDate) => {
   return periods;
 };
 
-// Update: Pass macToRoomMap and room to calculateEnergyFromBuckets in getEnergyReadings
+// Get energy readings from InfluxDB
 const getEnergyReadings = async (
   period,
   dateRange,
@@ -302,37 +299,44 @@ const getEnergyReadings = async (
     const timePeriods = getTimePeriods(period, dateRange, inputDate);
     const results = [];
 
-    // Process periods in batches to avoid overwhelming Elasticsearch
+    // Process periods in batches to avoid overwhelming InfluxDB
     const batchSize = 10;
     for (let i = 0; i < timePeriods.length; i += batchSize) {
       const batch = timePeriods.slice(i, i + batchSize);
 
       const batchPromises = batch.map(async (timePeriod) => {
-        const periodRange = {
-          gte: timePeriod.utcStart,
-          lte: timePeriod.utcEnd,
-        };
+        let query = `
+          from(bucket: "${INFLUXDB_BUCKET}")
+            |> range(start: ${timePeriod.utcStart}, stop: ${timePeriod.utcEnd})
+            |> filter(fn: (r) => r._measurement == "pzem")
+            |> filter(fn: (r) => r._field == "energy")
+        `;
 
-        const query = buildEsQuery(periodRange, macFilter);
-        const response = await esClient.search({
-          index: "pzem_idx",
-          body: query,
-        });
+        // Add MAC filter if specified
+        if (macFilter && macFilter.length > 0) {
+          const macAddresses = macFilter.map((mac) => `"${mac}"`).join(", ");
+          query += `
+            |> filter(fn: (r) => contains(value: r.mac_address, set: [${macAddresses}]))
+          `;
+        }
 
-        const energy = response.aggregations?.by_mac?.buckets?.length
-          ? calculateEnergyFromBuckets(
-              response.aggregations.by_mac.buckets,
-              macToRoomMap,
-              room
-            )
-          : { consumption: 0, supply: 0 };
+        query += `
+          |> sort(columns: ["_time"])
+        `;
+
+        const data = await queryApi.collectRows(query);
+
+        const energy =
+          data.length > 0
+            ? calculateEnergyFromInfluxData(data, macToRoomMap, room)
+            : { consumption: 0, supply: 0 };
 
         return {
           timestamp: timePeriod.timestamp,
           fullTimestamp: timePeriod.fullTimestamp,
           period: timePeriod.period,
-          utcStart: timePeriod.utcStart, // Include for debugging
-          utcEnd: timePeriod.utcEnd, // Include for debugging
+          utcStart: timePeriod.utcStart,
+          utcEnd: timePeriod.utcEnd,
           ...energy,
         };
       });
@@ -351,28 +355,20 @@ const getEnergyReadings = async (
   }
 };
 
-// Rooms endpoint with caching
+// Rooms endpoint
 app.get("/api/rooms", async (req, res) => {
   try {
-    const response = await esClient.search({
-      index: "meters_idx",
-      timeout: "30s",
-      body: {
-        aggs: {
-          unique_rooms: {
-            terms: {
-              field: "room_id",
-              size: 1000,
-            },
-          },
-        },
-        size: 0,
-      },
-    });
+    const query = `
+      from(bucket: "${INFLUXDB_BUCKET}")
+        |> range(start: 0)
+        |> filter(fn: (r) => r._measurement == "meters")
+        |> filter(fn: (r) => r._field == "room_id")
+        |> distinct(column: "_value")
+        |> sort(columns: ["_value"])
+    `;
 
-    const rooms = response.aggregations.unique_rooms.buckets
-      .map((bucket) => bucket.key)
-      .sort((a, b) => a - b);
+    const rows = await queryApi.collectRows(query);
+    const rooms = rows.map((row) => row._value).sort((a, b) => a - b);
 
     res.json({ rooms });
   } catch (error) {
@@ -381,7 +377,7 @@ app.get("/api/rooms", async (req, res) => {
   }
 });
 
-// Main API endpoint - pass macToRoomMap and room to getEnergyReadings
+// Main API endpoint
 app.get("/api/data", async (req, res) => {
   console.log("📥 Received request for energy data:", req.query);
 
@@ -409,7 +405,7 @@ app.get("/api/data", async (req, res) => {
     const macToRoomMap = await getMetersMapping();
     const dateRange = buildDateRangeQuery(period, date);
 
-    // Build MAC filter for room (do not change this logic)
+    // Build MAC filter for room
     let macFilter = [];
     if (room) {
       const macsForRoom = Object.entries(macToRoomMap)
@@ -417,7 +413,7 @@ app.get("/api/data", async (req, res) => {
         .map(([mac]) => mac);
 
       if (macsForRoom.length) {
-        macFilter = [{ terms: { "mac_address.keyword": macsForRoom } }];
+        macFilter = macsForRoom;
       } else {
         return res.json({
           data: [],
