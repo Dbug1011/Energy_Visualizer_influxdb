@@ -39,18 +39,19 @@ app.use(express.json());
 
 // InfluxDB client configuration
 const influxDB = new InfluxDB({
-  url: process.env.INFLUXDB_URL,
-  token: process.env.INFLUXDB_TOKEN,
+  url: process.env.INFLUX_URL,
+  token: process.env.INFLUX_TOKEN,
 });
 
-const queryApi = influxDB.getQueryApi(process.env.INFLUXDB_ORG);
-const INFLUXDB_BUCKET = process.env.INFLUXDB_BUCKET;
+const queryApi = influxDB.getQueryApi(process.env.INFLUX_ORG);
+const INFLUX_BUCKET_PZEM = process.env.INFLUX_BUCKET_PZEM;
+const INFLUX_BUCKET_METERS = process.env.INFLUX_BUCKET_METERS;
 
 // Test InfluxDB connection on startup
 (async () => {
   try {
     const testQuery = `
-      from(bucket: "${INFLUXDB_BUCKET}")
+      from(bucket: "${INFLUX_BUCKET_PZEM}")
         |> range(start: -1h)
         |> limit(n: 1)
     `;
@@ -68,7 +69,17 @@ app.get("/api/health", (req, res) => {
 });
 
 // Helper functions
-const normalizeMacAddress = (mac) => mac.toLowerCase();
+const normalizeMacAddress = (mac) => {
+  if (!mac) return null;
+  // Remove colons, spaces, hyphens and convert to lowercase for comparison
+  return mac.replace(/[:\s-]/g, "").toLowerCase();
+};
+
+// Function to convert normalized MAC back to colon format
+const formatMacAddress = (normalizedMac) => {
+  if (!normalizedMac || normalizedMac.length !== 12) return normalizedMac;
+  return normalizedMac.replace(/(.{2})/g, "$1:").slice(0, -1);
+};
 
 // Cache for meters mapping to avoid repeated queries
 let metersCache = null;
@@ -78,40 +89,89 @@ const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 const getMetersMapping = async () => {
   const now = Date.now();
 
-  // Return cached data if still valid
   if (metersCache && cacheTimestamp && now - cacheTimestamp < CACHE_DURATION) {
+    console.log("📋 Using cached meters mapping");
     return metersCache;
   }
 
   try {
-    // Query meters mapping from InfluxDB
+    console.log("🔍 Fetching meters mapping from InfluxDB...");
+
+    // Query to get all meter_mac and room_id combinations
     const query = `
-      from(bucket: "${INFLUXDB_BUCKET}")
+      from(bucket: "${INFLUX_BUCKET_METERS}")
         |> range(start: 0)
         |> filter(fn: (r) => r._measurement == "meters")
         |> filter(fn: (r) => r._field == "room_id")
-        |> distinct(column: "meter_mac")
-        |> keep(columns: ["meter_mac", "_value"])
+        |> keep(columns: ["meter_mac", "_value", "_time"])
+        |> group(columns: ["meter_mac"])
+        |> last()
         |> rename(columns: {_value: "room_id"})
     `;
 
     const rows = await queryApi.collectRows(query);
+    console.log("📊 Raw meters mapping data:", rows.length, "records");
+
     const macToRoomMap = {};
+    const roomToMacsMap = {};
+    const originalMacFormats = {}; // Store original formats for InfluxDB queries
 
     rows.forEach((row) => {
-      if (row.meter_mac && row.room_id) {
-        macToRoomMap[normalizeMacAddress(row.meter_mac)] = row.room_id;
+      if (row.meter_mac && row.room_id !== undefined) {
+        const originalMac = row.meter_mac;
+        const normalizedMac = normalizeMacAddress(originalMac);
+        const roomId = row.room_id.toString();
+
+        if (normalizedMac) {
+          macToRoomMap[normalizedMac] = roomId;
+          originalMacFormats[normalizedMac] = originalMac;
+
+          // Also create reverse mapping for easier lookup
+          if (!roomToMacsMap[roomId]) {
+            roomToMacsMap[roomId] = [];
+          }
+          roomToMacsMap[roomId].push({
+            normalized: normalizedMac,
+            original: originalMac,
+          });
+        }
       }
     });
 
-    // Update cache
-    metersCache = macToRoomMap;
+    console.log(
+      "🗂️ Processed MAC to Room mapping:",
+      Object.keys(macToRoomMap).length,
+      "entries"
+    );
+    console.log("🗂️ Available rooms:", Object.keys(roomToMacsMap));
+
+    // Log some examples for debugging
+    Object.entries(macToRoomMap)
+      .slice(0, 3)
+      .forEach(([mac, room]) => {
+        console.log(`   📍 MAC ${formatMacAddress(mac)} → Room ${room}`);
+      });
+
+    const mappingData = {
+      macToRoomMap,
+      roomToMacsMap,
+      originalMacFormats,
+    };
+
+    metersCache = mappingData;
     cacheTimestamp = now;
 
-    return macToRoomMap;
+    return mappingData;
   } catch (error) {
     console.error("❌ Error fetching meters mapping:", error.message);
-    return metersCache || {}; // Return cached data if available, otherwise empty object
+    console.error("Stack trace:", error.stack);
+    return (
+      metersCache || {
+        macToRoomMap: {},
+        roomToMacsMap: {},
+        originalMacFormats: {},
+      }
+    );
   }
 };
 
@@ -149,7 +209,7 @@ const buildDateRangeQuery = (period, date) => {
 // Build InfluxDB query for energy consumption
 const buildInfluxQuery = (dateRange, macFilter, timePeriod = null) => {
   let query = `
-    from(bucket: "${INFLUXDB_BUCKET}")
+    from(bucket: "${INFLUX_BUCKET_PZEM}")
       |> range(start: ${dateRange.start}, stop: ${dateRange.stop})
       |> filter(fn: (r) => r._measurement == "pzem")
       |> filter(fn: (r) => r._field == "energy")
@@ -174,22 +234,39 @@ const buildInfluxQuery = (dateRange, macFilter, timePeriod = null) => {
 };
 
 // Calculate energy consumption from InfluxDB results
-const calculateEnergyFromInfluxData = (data, macToRoomMap, room) => {
+const calculateEnergyFromInfluxData = (data, mappingData, room) => {
   let consumptionEnergy = 0;
   let supplyEnergy = 0;
+
+  const { macToRoomMap } = mappingData;
 
   // Group data by MAC address
   const macGroups = {};
   data.forEach((row) => {
-    if (!macGroups[row.mac_address]) {
-      macGroups[row.mac_address] = [];
+    const normalizedMac = normalizeMacAddress(row.mac_address);
+    if (normalizedMac) {
+      if (!macGroups[normalizedMac]) {
+        macGroups[normalizedMac] = [];
+      }
+      macGroups[normalizedMac].push(row);
     }
-    macGroups[row.mac_address].push(row);
   });
 
+  console.log(
+    "📈 Processing energy data for MACs:",
+    Object.keys(macGroups).map((mac) => formatMacAddress(mac))
+  );
+
   // Calculate energy delta for each MAC
-  Object.entries(macGroups).forEach(([macAddress, readings]) => {
-    if (readings.length < 2) return; // Need at least 2 readings to calculate delta
+  Object.entries(macGroups).forEach(([normalizedMac, readings]) => {
+    if (readings.length < 2) {
+      console.log(
+        `⚠️ Insufficient readings for MAC ${formatMacAddress(normalizedMac)}: ${
+          readings.length
+        } readings`
+      );
+      return;
+    }
 
     // Sort by time to get first and last readings
     readings.sort((a, b) => new Date(a._time) - new Date(b._time));
@@ -197,30 +274,57 @@ const calculateEnergyFromInfluxData = (data, macToRoomMap, room) => {
     const lastReading = readings[readings.length - 1];
 
     const energyDelta = lastReading._value - firstReading._value;
-    const normalizedMac = normalizeMacAddress(macAddress);
 
-    if (normalizedMac === SUPPLY_MAC_NORMALIZED) {
+    // Check if this is the supply meter
+    const normalizedSupplyMac = normalizeMacAddress(SUPPLY_MAC_NORMALIZED);
+    if (normalizedMac === normalizedSupplyMac) {
       supplyEnergy += energyDelta;
+      console.log(
+        `🔌 Supply energy from ${formatMacAddress(
+          normalizedMac
+        )}: ${energyDelta} kWh`
+      );
     } else if (room) {
       // If a specific room is requested
-      if (
-        macToRoomMap.hasOwnProperty(normalizedMac) &&
-        macToRoomMap[normalizedMac].toString() === room.toString()
-      ) {
+      const macRoom = macToRoomMap[normalizedMac];
+      console.log(
+        `🏠 MAC ${formatMacAddress(
+          normalizedMac
+        )} belongs to room ${macRoom}, requested room: ${room}`
+      );
+
+      if (macRoom && macRoom.toString() === room.toString()) {
         consumptionEnergy += energyDelta;
+        console.log(
+          `✅ Added consumption from room ${room}: ${energyDelta} kWh`
+        );
       }
     } else {
       // For all rooms: only sum MACs that are in meters table
       if (macToRoomMap.hasOwnProperty(normalizedMac)) {
         consumptionEnergy += energyDelta;
+        console.log(
+          `✅ Added consumption from MAC ${formatMacAddress(
+            normalizedMac
+          )} (room ${macToRoomMap[normalizedMac]}): ${energyDelta} kWh`
+        );
+      } else {
+        console.log(
+          `❌ MAC ${formatMacAddress(
+            normalizedMac
+          )} not found in meters mapping`
+        );
       }
     }
   });
 
-  return {
+  const result = {
     consumption: Math.max(0, parseFloat(consumptionEnergy.toFixed(3))),
     supply: Math.max(0, parseFloat(supplyEnergy.toFixed(3))),
   };
+
+  console.log("🎯 Energy calculation result:", result);
+  return result;
 };
 
 // Generic function to get time periods - properly handles local to UTC conversion
@@ -292,12 +396,16 @@ const getEnergyReadings = async (
   dateRange,
   macFilter,
   inputDate,
-  macToRoomMap,
+  mappingData,
   room
 ) => {
   try {
     const timePeriods = getTimePeriods(period, dateRange, inputDate);
     const results = [];
+
+    console.log(
+      `⏰ Processing ${timePeriods.length} time periods for ${period} view`
+    );
 
     // Process periods in batches to avoid overwhelming InfluxDB
     const batchSize = 10;
@@ -306,7 +414,7 @@ const getEnergyReadings = async (
 
       const batchPromises = batch.map(async (timePeriod) => {
         let query = `
-          from(bucket: "${INFLUXDB_BUCKET}")
+          from(bucket: "${INFLUX_BUCKET_PZEM}")
             |> range(start: ${timePeriod.utcStart}, stop: ${timePeriod.utcEnd})
             |> filter(fn: (r) => r._measurement == "pzem")
             |> filter(fn: (r) => r._field == "energy")
@@ -328,7 +436,7 @@ const getEnergyReadings = async (
 
         const energy =
           data.length > 0
-            ? calculateEnergyFromInfluxData(data, macToRoomMap, room)
+            ? calculateEnergyFromInfluxData(data, mappingData, room)
             : { consumption: 0, supply: 0 };
 
         return {
@@ -359,7 +467,7 @@ const getEnergyReadings = async (
 app.get("/api/rooms", async (req, res) => {
   try {
     const query = `
-      from(bucket: "${INFLUXDB_BUCKET}")
+      from(bucket: "${INFLUX_BUCKET_METERS}")
         |> range(start: 0)
         |> filter(fn: (r) => r._measurement == "meters")
         |> filter(fn: (r) => r._field == "room_id")
@@ -374,6 +482,59 @@ app.get("/api/rooms", async (req, res) => {
   } catch (error) {
     console.error("❌ Error fetching rooms:", error.message);
     res.status(500).json({ error: "Failed to fetch rooms" });
+  }
+});
+
+// Debug endpoint to help troubleshoot MAC address matching
+app.get("/api/debug/mappings", async (req, res) => {
+  try {
+    const mappingData = await getMetersMapping();
+
+    // Also get raw data from both buckets for comparison
+    const pzemQuery = `
+      from(bucket: "${INFLUX_BUCKET_PZEM}")
+        |> range(start: -24h)
+        |> filter(fn: (r) => r._measurement == "pzem")
+        |> filter(fn: (r) => r._field == "energy")
+        |> distinct(column: "mac_address")
+        |> keep(columns: ["mac_address"])
+        |> limit(n: 20)
+    `;
+
+    const metersQuery = `
+      from(bucket: "${INFLUX_BUCKET_METERS}")
+        |> range(start: 0)
+        |> filter(fn: (r) => r._measurement == "meters")
+        |> distinct(column: "meter_mac")
+        |> keep(columns: ["meter_mac"])
+        |> limit(n: 20)
+    `;
+
+    const [pzemMacs, meterMacs] = await Promise.all([
+      queryApi.collectRows(pzemQuery),
+      queryApi.collectRows(metersQuery),
+    ]);
+
+    res.json({
+      mappingData,
+      debug: {
+        pzemMacs: pzemMacs.map((row) => ({
+          original: row.mac_address,
+          normalized: normalizeMacAddress(row.mac_address),
+        })),
+        meterMacs: meterMacs.map((row) => ({
+          original: row.meter_mac,
+          normalized: normalizeMacAddress(row.meter_mac),
+        })),
+        supplyMac: {
+          original: SUPPLY_MAC_NORMALIZED,
+          normalized: normalizeMacAddress(SUPPLY_MAC_NORMALIZED),
+        },
+      },
+    });
+  } catch (error) {
+    console.error("❌ Debug endpoint error:", error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -402,22 +563,38 @@ app.get("/api/data", async (req, res) => {
     }
 
     // Get meters mapping
-    const macToRoomMap = await getMetersMapping();
+    const mappingData = await getMetersMapping();
+    const { macToRoomMap, roomToMacsMap, originalMacFormats } = mappingData;
+
+    console.log("🗂️ Available rooms:", Object.keys(roomToMacsMap));
+    console.log("🔍 Requested room:", room);
+
     const dateRange = buildDateRangeQuery(period, date);
 
     // Build MAC filter for room
     let macFilter = [];
     if (room) {
-      const macsForRoom = Object.entries(macToRoomMap)
-        .filter(([mac, roomId]) => roomId.toString() === room.toString())
-        .map(([mac]) => mac);
+      const macsForRoom = roomToMacsMap[room.toString()] || [];
 
-      if (macsForRoom.length) {
-        macFilter = macsForRoom;
+      if (macsForRoom.length > 0) {
+        // Use original MAC formats for InfluxDB query
+        macFilter = macsForRoom.map((macInfo) => macInfo.original);
+        console.log("🎯 MAC filter for room", room, ":", macFilter);
       } else {
+        console.log("❌ No meters found for room:", room);
         return res.json({
           data: [],
-          message: "No meters found for the selected room.",
+          message: `No meters found for room ${room}. Available rooms: ${Object.keys(
+            roomToMacsMap
+          ).join(", ")}`,
+          meta: {
+            period,
+            room,
+            date,
+            timezone: TIMEZONE,
+            totalRecords: 0,
+            availableRooms: Object.keys(roomToMacsMap),
+          },
         });
       }
     }
@@ -428,7 +605,7 @@ app.get("/api/data", async (req, res) => {
       dateRange,
       macFilter,
       date,
-      macToRoomMap,
+      mappingData,
       room
     );
 
@@ -440,6 +617,8 @@ app.get("/api/data", async (req, res) => {
         date,
         timezone: TIMEZONE,
         totalRecords: result.length,
+        availableRooms: Object.keys(roomToMacsMap),
+        macMappingCount: Object.keys(macToRoomMap).length,
       },
     });
   } catch (error) {
@@ -451,7 +630,7 @@ app.get("/api/data", async (req, res) => {
   }
 });
 
-// Start server
+// Correct way to start the server
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running at http://0.0.0.0:${PORT}`);
 });
